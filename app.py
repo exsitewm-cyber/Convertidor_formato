@@ -1,110 +1,104 @@
 import io
 import streamlit as st
 from pptx import Presentation
-from pptx.util import Inches
+from pptx.enum.shapes import PP_PLACEHOLDER
 
 # Configuración de página
-st.set_page_config(page_title="Editor PPTX Avanzado", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Editor PPTX Avanzado v4", page_icon="📊", layout="wide")
 
-# Inicializar la "memoria" para guardar las plantillas
 if 'plantillas_guardadas' not in st.session_state:
     st.session_state['plantillas_guardadas'] = {}
 
 # ==========================================
-# FUNCIONES NÚCLEO (PROCESAMIENTO PPTX)
+# MOTOR DE PROCESAMIENTO Y MAPEO PPTX
 # ==========================================
 
-def extraer_secciones_pptx(file_stream, max_slides=5):
-    """Extrae el texto identificando si es Título o Contenido para el Preview"""
+def analizar_textos_originales(file_stream, max_slides=5):
+    """Extrae el texto puro del archivo a modificar, sin ningún formato."""
     file_stream.seek(0)
     prs = Presentation(file_stream)
-    slides_data = []
+    datos = []
     
     for i, slide in enumerate(prs.slides):
         if i >= max_slides: break
-        slide_info = {"titulo": "", "contenido": [], "layout": slide.slide_layout.name}
+        diapositiva_datos = {"titulo": "", "cuerpo": []}
         
-        for shape in slide.shapes:
-            if not shape.has_text_frame or not shape.text.strip():
-                continue
+        # Extraer Título
+        if slide.shapes.title and slide.shapes.title.has_text_frame:
+            diapositiva_datos["titulo"] = slide.shapes.title.text.strip()
             
-            # Si el shape es el título de la diapositiva
-            if shape == slide.shapes.title:
-                slide_info["titulo"] = shape.text
-            else:
-                # Todo lo demás se considera contenido/cuerpo
-                slide_info["contenido"].append(shape.text)
-                
-        slides_data.append(slide_info)
+        # Extraer Cuerpo (párrafos y niveles de viñetas)
+        for shape in slide.shapes:
+            if shape == slide.shapes.title: continue
+            if shape.has_text_frame:
+                for p in shape.text_frame.paragraphs:
+                    texto = p.text.strip()
+                    if texto:
+                        diapositiva_datos["cuerpo"].append({"texto": texto, "nivel": p.level})
+                        
+        datos.append(diapositiva_datos)
     file_stream.seek(0)
-    return slides_data
+    return datos
 
-def procesar_pptx(stream_origen, stream_plantilla_bytes):
-    """Aplica la plantilla transfiriendo el texto a los placeholders nativos"""
+def analizar_layout_plantilla(stream_plantilla_bytes):
+    """Analiza los espacios (Placeholders) disponibles en el diseño de la plantilla seleccionada."""
+    prs_plantilla = Presentation(io.BytesIO(stream_plantilla_bytes))
+    layout = prs_plantilla.slide_layouts[1] if len(prs_plantilla.slide_layouts) > 1 else prs_plantilla.slide_layouts[0]
+    
+    placeholders_info = []
+    for ph in layout.placeholders:
+        tipo = ph.placeholder_format.type
+        nombre_tipo = "TÍTULO" if tipo == PP_PLACEHOLDER.TITLE else ("CUERPO/OBJETO" if tipo in [PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT] else f"OTRO ({tipo})")
+        placeholders_info.append({"id": ph.placeholder_format.idx, "tipo": nombre_tipo, "nombre": ph.name})
+        
+    return placeholders_info
+
+def inyectar_formato_puro(stream_origen, stream_plantilla_bytes):
+    """Genera el PPTX forzando el formato maestro de la plantilla seleccionada."""
     stream_origen.seek(0)
     prs_origen = Presentation(stream_origen)
     prs_plantilla = Presentation(io.BytesIO(stream_plantilla_bytes))
 
-    # Truco avanzado: Eliminar las diapositivas de ejemplo que traiga la plantilla
-    # para dejar solo los formatos maestros limpios.
+    # Limpiar diapositivas de ejemplo que traiga la plantilla
     xml_slides = prs_plantilla.slides._sldIdLst  
-    slides = list(xml_slides)
-    for s in slides:
+    for s in list(xml_slides):
         xml_slides.remove(s)
 
-    # Procesar cada diapositiva de la presentación original
     for slide_orig in prs_origen.slides:
-        
-        # 1. Intentar usar el mismo índice de Layout (Diseño) que el original
-        try:
-            layout_idx = prs_origen.slide_layouts.index(slide_orig.slide_layout)
-            # Asegurarse que la plantilla tenga ese índice, si no, usa el layout 1 (Título y Objetos)
-            if layout_idx >= len(prs_plantilla.slide_layouts):
-                layout_idx = 1 
-        except:
-            layout_idx = 1
-            
-        layout_target = prs_plantilla.slide_layouts[layout_idx]
-        new_slide = prs_plantilla.slides.add_slide(layout_target)
-        
-        # 2. Mapear y transferir el contenido respetando el Master Format
-        for shape_orig in slide_orig.shapes:
-            if not shape_orig.has_text_frame or not shape_orig.text.strip():
-                continue
+        # Extraer texto crudo de la original
+        titulo_texto = slide_orig.shapes.title.text.strip() if slide_orig.shapes.title else ""
+        cuerpo_datos = []
+        for shape in slide_orig.shapes:
+            if shape == slide_orig.shapes.title: continue
+            if shape.has_text_frame:
+                for p in shape.text_frame.paragraphs:
+                    if p.text.strip():
+                        cuerpo_datos.append((p.text, p.level))
+
+        # Crear nueva diapositiva basada en la plantilla elegida
+        layout = prs_plantilla.slide_layouts[1] if len(prs_plantilla.slide_layouts) > 1 else prs_plantilla.slide_layouts[0]
+        new_slide = prs_plantilla.slides.add_slide(layout)
+
+        # Inyectar Título (al asignar .text directamente, hereda 100% el formato de la plantilla)
+        if new_slide.shapes.title and titulo_texto:
+            new_slide.shapes.title.text = titulo_texto
+
+        # Inyectar Cuerpo
+        cuerpo_inyectado = False
+        for ph in new_slide.placeholders:
+            if ph.placeholder_format.type in [PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT]:
+                tf = ph.text_frame
+                tf.clear() # Limpia texto predeterminado del marcador
                 
-            target_shape = None
-            
-            # Si es el Título original, pasarlo al Título de la nueva
-            if shape_orig == slide_orig.shapes.title and new_slide.shapes.title:
-                target_shape = new_slide.shapes.title
-            else:
-                # Buscar el siguiente marcador de posición (Placeholder) vacío para el cuerpo
-                for placeholder in new_slide.placeholders:
-                    if placeholder.placeholder_format.idx != 0 and placeholder.text == "":
-                        target_shape = placeholder
-                        break
-            
-            # Si se encontró un lugar donde poner el texto en la plantilla
-            if target_shape and target_shape.has_text_frame:
-                target_tf = target_shape.text_frame
-                
-                # Copiar párrafo por párrafo para mantener las viñetas (bullets)
-                # IMPORTANTE: NO tocamos las fuentes/colores para que hereden de la plantilla
-                for i, p_orig in enumerate(shape_orig.text_frame.paragraphs):
-                    if i == 0:
-                        p_new = target_tf.paragraphs[0]
-                    else:
-                        p_new = target_tf.add_paragraph()
-                        
-                    p_new.text = p_orig.text
+                for texto, nivel in cuerpo_datos:
+                    p = tf.add_paragraph()
+                    p.text = texto # Asignación cruda: fuerza la fuente y color del Patrón
                     try:
-                        p_new.level = p_orig.level # Mantiene la indentación/viñetas
+                        p.level = nivel # Mantiene la jerarquía de viñetas
                     except:
                         pass
-            else:
-                # Fallback: Si la plantilla no tiene espacios suficientes, crea un cuadro de texto libre
-                tb = new_slide.shapes.add_textbox(Inches(1), Inches(2), Inches(8), Inches(4))
-                tb.text = shape_orig.text
+                cuerpo_inyectado = True
+                break # Solo llenamos el primer marcador de cuerpo principal
 
     output_stream = io.BytesIO()
     prs_plantilla.save(output_stream)
@@ -112,15 +106,14 @@ def procesar_pptx(stream_origen, stream_plantilla_bytes):
     return output_stream
 
 # ==========================================
-# INTERFAZ DE USUARIO (UI) Y NAVEGACIÓN
+# INTERFAZ (UI) Y NAVEGADOR
 # ==========================================
 
-st.sidebar.header("📁 Gestor de Plantillas")
+st.sidebar.header("📁 Tus Plantillas Maestras")
 st.sidebar.write(f"Almacenadas: {len(st.session_state['plantillas_guardadas'])} / 5")
 
-# Listar y eliminar plantillas
 if st.session_state['plantillas_guardadas']:
-    st.sidebar.markdown("**Tus Plantillas:**")
+    st.sidebar.markdown("---")
     for nombre_plantilla in list(st.session_state['plantillas_guardadas'].keys()):
         col1, col2 = st.sidebar.columns([0.8, 0.2])
         col1.write(f"🎨 {nombre_plantilla}")
@@ -129,89 +122,80 @@ if st.session_state['plantillas_guardadas']:
             st.rerun()
 
 st.sidebar.markdown("---")
-
-# Subir plantillas nuevas
 if len(st.session_state['plantillas_guardadas']) < 5:
     nuevas_plantillas = st.sidebar.file_uploader(
-        "Añadir plantilla base (.pptx)", 
-        type=["pptx"], 
-        accept_multiple_files=True
+        "Añadir plantilla (.pptx)", type=["pptx"], accept_multiple_files=True
     )
     if nuevas_plantillas:
         for p in nuevas_plantillas:
             if len(st.session_state['plantillas_guardadas']) < 5:
                 st.session_state['plantillas_guardadas'][p.name] = p.getvalue()
         st.rerun()
-else:
-    st.sidebar.warning("⚠️ Máximo de 5 plantillas alcanzado.")
 
-st.sidebar.info("💡 **Nota:** Ya no hay selector de colores. El sistema aplicará los colores, tamaños y tipografías directamente desde la plantilla que elijas.")
+st.title("📊 Procesador de Plantillas PPTX Exacto")
 
-# ==========================================
-# ÁREA PRINCIPAL Y PREVISUALIZACIÓN
-# ==========================================
-st.title("📊 Procesador de Diapositivas Inteligente")
-
-archivo_original = st.file_uploader("1. Sube la presentación con el contenido a procesar (.pptx)", type=["pptx"])
+archivo_original = st.file_uploader("1. Sube tu presentación original (.pptx)", type=["pptx"])
 
 if archivo_original and st.session_state['plantillas_guardadas']:
     st.markdown("---")
-    
     nombres_plantillas = list(st.session_state['plantillas_guardadas'].keys())
-    plantilla_seleccionada = st.selectbox("2. Elige la Plantilla Maestra a aplicar:", nombres_plantillas)
+    
+    # 2. Selector de Plantillas (Al cambiar esto, cambia la vista previa dinámicamente)
+    plantilla_seleccionada = st.selectbox("2. Selecciona la Plantilla a Aplicar:", nombres_plantillas)
     bytes_plantilla = st.session_state['plantillas_guardadas'][plantilla_seleccionada]
     
-    st.markdown(f"### 👀 Análisis de Secciones y Distribución")
-    st.caption("Visualiza cómo la Inteligencia del script desglosa tu documento original y lo prepara para inyectarlo en los marcadores de la plantilla seleccionada.")
+    # Analizar cómo está construida la plantilla seleccionada
+    estructura_plantilla = analizar_layout_plantilla(bytes_plantilla)
+    datos_originales = analizar_textos_originales(archivo_original)
     
-    datos_diapositivas = extraer_secciones_pptx(archivo_original)
+    st.markdown(f"### 👀 Mapeo Dinámico: {plantilla_seleccionada}")
+    st.caption("Esta vista te muestra exactamente en qué secciones de la plantilla seleccionada se distribuirá tu texto original. El archivo descargado tendrá los colores y fuentes definidos por el diseñador de esta plantilla.")
     
-    # Mostrar la previsualización seccionada
-    for idx, slide in enumerate(datos_diapositivas):
-        with st.container():
-            st.markdown(f"**Diapositiva {idx+1}** (Diseño original detectado: `{slide['layout']}`)")
-            col1, col2 = st.columns(2)
+    # Mostrar la estructura detectada en la plantilla
+    st.info(f"**Estructura detectada en '{plantilla_seleccionada}':** " + 
+            " | ".join([f"📦 {ph['tipo']} ({ph['nombre']})" for ph in estructura_plantilla]))
+    
+    # Mostrar el preview dinámico (Primeras 3 diapositivas)
+    for idx, slide in enumerate(datos_originales[:3]):
+        st.markdown(f"#### Diapositiva {idx+1}")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Contenido Original Extraído:**")
+            st.markdown(f"> **TÍTULO:** {slide['titulo'] if slide['titulo'] else '*(Vacío)*'}")
+            cuerpo_str = "\n".join([f"- {item['texto']}" for item in slide['cuerpo']])
+            st.markdown(f"> **CUERPO:**\n{cuerpo_str if cuerpo_str else '*(Vacío)*'}")
             
-            # Caja de Título
-            with col1:
-                html_titulo = f"""
-                <div style='border-left: 5px solid #0056b3; background-color: #f0f7ff; padding: 15px; border-radius: 5px; margin-bottom: 10px; height: 100%;'>
-                    <small style='color: #0056b3; font-weight: bold;'>SECCIÓN: TÍTULO PRINCIPAL</small>
-                    <h3 style='color: #333; margin-top: 5px;'>{slide['titulo'] if slide['titulo'] else '<i>Sin título detectado</i>'}</h3>
-                    <small style='color: #666;'>→ Se aplicará el color y fuente del Título de '{plantilla_seleccionada}'</small>
-                </div>
-                """
-                st.markdown(html_titulo, unsafe_allow_html=True)
+        with col2:
+            st.markdown(f"**Cómo se inyectará en '{plantilla_seleccionada}':**")
+            html_preview = "<div style='border: 2px dashed #4CAF50; padding: 15px; border-radius: 10px; background-color: #fafafa;'>"
             
-            # Caja de Contenido
-            with col2:
-                texto_cuerpo = "<br>".join(slide['contenido']) if slide['contenido'] else "<i>Sin cuerpo de texto detectado</i>"
-                html_cuerpo = f"""
-                <div style='border-left: 5px solid #28a745; background-color: #f2fff5; padding: 15px; border-radius: 5px; margin-bottom: 10px; height: 100%;'>
-                    <small style='color: #28a745; font-weight: bold;'>SECCIÓN: CUERPO Y VIÑETAS</small>
-                    <p style='color: #444; margin-top: 5px; font-size: 14px;'>{texto_cuerpo}</p>
-                    <small style='color: #666;'>→ Heredará distribución, colores base y tipografía de cuerpo de '{plantilla_seleccionada}'</small>
-                </div>
-                """
-                st.markdown(html_cuerpo, unsafe_allow_html=True)
-        st.write("") # Espaciador
+            # Simular Título en Plantilla
+            if slide['titulo']:
+                html_preview += f"<div style='background-color:#e8f5e9; padding:10px; margin-bottom:10px; border-radius:5px;'><small style='color:#2E7D32;'>Enviado al marcador: TÍTULO</small><br><b>{slide['titulo']}</b></div>"
+            
+            # Simular Cuerpo en Plantilla
+            if slide['cuerpo']:
+                html_preview += f"<div style='background-color:#e3f2fd; padding:10px; border-radius:5px;'><small style='color:#1565C0;'>Enviado al marcador: CUERPO/OBJETO (Heredando fuente, color y viñetas de la plantilla)</small><br>"
+                for item in slide['cuerpo']:
+                    indent = "&nbsp;" * (item['nivel'] * 4)
+                    html_preview += f"<div>{indent}• {item['texto']}</div>"
+                html_preview += "</div>"
+                
+            html_preview += "</div>"
+            st.markdown(html_preview, unsafe_allow_html=True)
+            
+        st.write("---")
 
-    st.markdown("---")
-    
     # Procesar y Descargar
-    if st.button("🚀 Aplicar Plantilla y Generar PowerPoint", type="primary"):
-        with st.spinner(f"Inyectando contenido en '{plantilla_seleccionada}'..."):
-            ppt_final = procesar_pptx(archivo_original, bytes_plantilla)
+    if st.button("🚀 Aplicar Plantilla y Descargar Archivo", type="primary"):
+        with st.spinner(f"Aplicando el formato exacto de '{plantilla_seleccionada}'..."):
+            ppt_final = inyectar_formato_puro(archivo_original, bytes_plantilla)
             
-        st.success("¡Documento transformado exitosamente bajo los estándares de la plantilla!")
+        st.success("¡Documento procesado! El formato, tipografía y colores de la plantilla han sido forzados.")
         st.download_button(
-            label="📥 Descargar Documento Final",
+            label="📥 Descargar Presentación Final",
             data=ppt_final,
-            file_name=f"PlantillaAplicada_{archivo_original.name}",
+            file_name=f"Final_{plantilla_seleccionada}_{archivo_original.name}",
             mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
         )
-
-elif not st.session_state['plantillas_guardadas']:
-    st.info("👈 Sube tus plantillas maestras en el menú de la izquierda para comenzar.")
-elif not archivo_original:
-    st.info("Sube un archivo original arriba para ver la distribución.")
